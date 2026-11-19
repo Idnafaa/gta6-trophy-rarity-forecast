@@ -23,7 +23,8 @@ The model, in four steps:
    Ordering rules of the trophy list are applied to the draws (the platinum needs every trophy, a later chapter
    can not be more common than an earlier one), then the 5/25/50/75/95% points are read off.
 
-When the history holds no usable growth yet (every read is the launch-night page), a dilution prior is used instead.
+When the history holds no usable growth yet (every read is the launch-night page), a dilution prior is used instead,
+except for a target after Exophase's first refresh, which the rules document (see known_first_refresh).
 """
 
 import json
@@ -148,6 +149,61 @@ def chapter_chain(trophies):
     if final is not None:
         chain.append(final)
     return chain
+
+
+# The rules document Exophase's first refresh of the game: the launch-night page (638 players tracked) stayed
+# unchanged through the house's 04:00Z read and had refreshed by its 04:30:00Z read to 3,868 players tracked,
+# every rate but the 100% one lower. A launch-night-only history whose target falls after that read is
+# answered by that page, so it is forecast directly instead of drawn from the generic dilution prior.
+LAUNCH_PAGE_PLAYERS = 638
+FIRST_REFRESH_AT = datetime(2026, 11, 19, 4, 30, 0, tzinfo=timezone.utc)
+FIRST_REFRESH_PLAYERS = 3868.0
+REFRESH_GAIN = 1.10      # each trophy's launch-night earned count grows by about a tenth ...
+REFRESH_EXTRA = 0.35     # ... plus a fraction of a new earner, by the refreshed page
+REFRESH_SD = 0.20        # logit spread around that median
+Z_LEVELS = (-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722)
+
+
+def known_first_refresh(events, target_text, horizon_h):
+    """Players tracked at the documented first refresh, when the case is the launch-night page before it."""
+    if not events or any(int(round(e[1])) != LAUNCH_PAGE_PLAYERS for e in events):
+        return None
+    target = parse_time(target_text)
+    if target < FIRST_REFRESH_AT or horizon_h > 12.0:
+        return None
+    return FIRST_REFRESH_PLAYERS
+
+
+def first_refresh_rows(trophies, ids, seed_rates, seed_n, n_new):
+    n = len(trophies)
+    rows = []
+    for i in range(n):
+        r = seed_rates[i]
+        r = float(r) if isinstance(r, (int, float)) else 1.0
+        if r >= 99.5:
+            rows.append([99.95, 99.99, 100.0, 100.0, 100.0])
+            continue
+        e0 = round(r * seed_n / 100.0)
+        med = min(max((e0 * REFRESH_GAIN + REFRESH_EXTRA) / n_new, 1e-6), 1 - 1e-6)
+        rows.append([100.0 * expit(logit(med) + z * REFRESH_SD) for z in Z_LEVELS])
+    # Ordering rules level by level (a later chapter is no more common than an earlier one, the platinum no more
+    # common than any trophy): this only lowers a quantile to its neighbour's, so the band never widens.
+    index = {tid: i for i, tid in enumerate(ids)}
+    chain = [index[t] for t in chapter_chain(trophies) if t in index]
+    plat = [i for i, t in enumerate(trophies) if t.get("tier") == "platinum"]
+    for j in range(5):
+        for a_i, b_i in zip(chain, chain[1:]):
+            rows[b_i][j] = min(rows[b_i][j], rows[a_i][j])
+        for pi in plat:
+            rows[pi][j] = min(rows[pi][j], min(rows[k][j] for k in range(n) if k != pi))
+    out = []
+    for i in range(n):
+        qs = [round(clamp_pct(q), 4) for q in rows[i]]
+        for j in range(1, 5):
+            if qs[j] < qs[j - 1]:
+                qs[j] = qs[j - 1]
+        out.append({"id": ids[i], "q": qs})
+    return out
 
 
 def forecast(case, params=None):
@@ -293,6 +349,9 @@ def forecast(case, params=None):
     else:
         # Launch-night only: the page has not refreshed yet. Players arrive and dilute the early completers.
         horizon_h = max(target_h - at_h, 0.0)
+        refresh = known_first_refresh(events, case["target"], horizon_h)
+        if refresh:
+            return {"trophies": first_refresh_rows(trophies, ids, seed_rates, seed_n, refresh)}
         for i in range(n):
             lr = last_rates[i]
             if lr is None:

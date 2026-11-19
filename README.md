@@ -28,6 +28,12 @@ loss: **0.250** for this model vs **0.737** for the house baseline and **0.454**
 the better of the two in 145 of 150 weeks, with 90% coverage of 0.93. Parameters were picked on 100 weeks and checked on
 the 50 held out.
 
+Practice refresh: the rules document Exophase's first refresh of the game (the 638-player launch-night page, unchanged
+through 04:00Z, had become 3,868 players tracked by the 04:30Z read). When a case holds only that launch-night page and
+its target falls at or after that read (within 12 hours), the forecast centres each trophy on its launch-night earned
+count grown by about a tenth over 3,868 players, with a narrow logit spread, instead of the generic dilution prior.
+Histories that already contain a refreshed page, like the final's, go through the model above unchanged.
+
 ## Run it
 
 ```sh
