@@ -1,30 +1,32 @@
-"""Week-one trophy earn-rate forecaster for GTA VI on Exophase (make.fun gta6-trophy-rarity-forecast-01).
+"""GTA VI week-one trophy earn-rate forecasts for make.fun (gta6-trophy-rarity-forecast-01).
 
-Python 3.13, standard library only, no network. Reads every <id>.in in $MAKEFUN_INPUT_DIR (default /input) and writes
-<id>.out to $MAKEFUN_OUTPUT_DIR (default /output).
+Reads each case file in $MAKEFUN_INPUT_DIR (default /input), writes the matching
+forecast to $MAKEFUN_OUTPUT_DIR (default /output). Python 3.13, standard library
+only, fully offline, seeded so two runs agree byte for byte.
 
-The model, in four steps:
+Method outline
+--------------
+Exophase republishes a game's trophy counts only when it refreshes them, so the
+house's many reads collapse to a short list of distinct pages ("events"). The
+launch-night page (638 tracked players, a few of whom already held everything)
+is treated as a fixed seed cohort: subtracting its earned counts leaves the
+earn rate of everyone who arrived later, which is the quantity worth trending.
 
-1. Refresh events. Exophase recomputes a game's counts on its own schedule, so consecutive house reads are often the
-   same page. Reads are collapsed into "events": one per distinct page (players tracked + every rate).
+For every trophy the post-launch cohort rate is put on the logit scale and
+regressed on log time since launch (weighted toward recent, larger pages). The
+slope is shrunk toward a slope pooled across trophies of similar level and
+damped before being carried to the target; tracked-player growth gets the same
+treatment on the log scale. Uncertainty (level, slope, drift, small-count noise,
+player growth) is propagated with a seeded Monte Carlo whose draws share a
+common component across trophies, the trophy list's ordering rules are imposed
+draw by draw, and the 5/25/50/75/95% quantiles are read off. Two calibrations
+from real launch-week data widen the upper tail and nudge the median up for
+trophies still near the floor, where the wave of progressing players is hardest
+to time, and a trophy already at ~100% stays pinned there.
 
-2. Counts, not rates. A rate is earned / tracked. Launch night was a few hundred players, a handful of whom (review or
-   early copies) already held every trophy, so early rates were inflated and then diluted as players arrived. Each
-   event's rate is turned into an earned count, and the launch-night page is kept apart as a fixed "seed" cohort.
-   What is modelled is the cohort rate g of everyone who arrived after it: (earned - seed earned) / (tracked - seed).
-
-3. Trend. For each trophy, logit(g) is fitted against ln(hours since launch + c) over the recent events by weighted
-   least squares (recent events and bigger cohorts weigh more), the slope is shrunk toward a slope pooled across
-   trophies at a similar level, damped, and carried to the target. Players tracked is extrapolated the same way on
-   ln N. The forecast rate mixes the seed cohort back in: (seed earned + g * (N - seed)) / N.
-
-4. Spread. Quantiles come from a seeded Monte Carlo over the uncertain pieces: the trend's level and slope, a
-   random-walk term that grows with the horizon, the count noise of rare trophies, and the growth of players tracked.
-   Ordering rules of the trophy list are applied to the draws (the platinum needs every trophy, a later chapter
-   can not be more common than an earlier one), then the 5/25/50/75/95% points are read off.
-
-When the history holds no usable growth yet (every read is the launch-night page), a dilution prior is used instead,
-except for a target after Exophase's first refresh, which the rules document (see known_first_refresh).
+A history that never left the launch-night page is answered from the first
+refresh the rules document (3,868 tracked players) when the target falls just
+after it, and from a wide dilution prior otherwise.
 """
 
 import json
@@ -35,385 +37,418 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
-LAUNCH = datetime(2026, 11, 18, 11, 0, 0, tzinfo=timezone.utc)  # midnight in New Zealand, first region to unlock
-LO, HI = 0.01, 99.99
+QUANTILES = (0.05, 0.25, 0.5, 0.75, 0.95)
+Z_OF_QUANTILE = (-1.6448536269514722, -0.6744897501960817, 0.0,
+                 0.6744897501960817, 1.6448536269514722)
+LAUNCH_UTC = datetime(2026, 11, 18, 11, 0, 0, tzinfo=timezone.utc)
+RATE_FLOOR, RATE_CEIL = 0.01, 99.99
 
-# Tuned on simulated launch weeks (see README); kept as plain constants so the run is deterministic.
-PARAMS = {
-    "c_hours": 3.0,        # offset in ln(hours + c)
-    "window_h": 40.0,      # events older than this before the last one are ignored by the trend fit
-    "decay_h": 18.0,       # recency weight e-folding time
-    "damp": 0.80,          # multiplier on the fitted slope
-    "n_damp": 0.75,        # multiplier on the players-tracked slope
-    "shrink_k": 2.0,       # pseudo-weight of the pooled slope
-    "rw": 0.16,            # random-walk sd per unit of ln-time on the logit scale
-    "slope_sd_mult": 1.0,  # inflation of the slope's standard error
-    "base_sd": 0.10,       # floor sd on the logit scale
-    "tail": 1.12,          # extra width at the 5% and 95% levels (fat tails)
-    "rho": 0.7,            # share of each draw's noise common to every trophy
+# Constants fitted on simulated launch weeks, then re-fitted on weeks conditioned
+# to match the real Exophase page two days after launch (see README).
+TUNING = {
+    "log_offset_h": 0.0,     # hours added inside ln(hours + offset)
+    "fit_window_h": 40.0,    # trend fit ignores events older than this before the last
+    "recency_halflife_h": 18.0,  # e-folding time of the recency weights
+    "slope_damp": 0.75,      # multiplier on each fitted logit slope
+    "players_damp": 0.4,     # multiplier on the tracked-players log slope
+    "pool_weight": 0.5,      # pseudo-weight of the pooled slope when shrinking
+    "drift_sd": 0.16,        # random-walk sd per unit of log time (logit scale)
+    "slope_sd_scale": 1.0,   # inflation of the slope standard error
+    "level_sd_floor": 0.10,  # minimum level sd on the logit scale
+    "tail_stretch": 1.3,     # extra width applied at the 5% and 95% quantiles
+    "common_share": 0.7,     # share of draw noise common to all trophies
     "draws": 3000,
+    "low_uptail": 0.5,       # extra upper-tail widening for near-floor trophies
+    "low_shift": 0.2,        # logit nudge up for near-floor trophies
+    "pin_full": 1.0,         # 1: a trophy at >=99.5% in the last read stays ~100%
 }
 
 
-def parse_time(text):
-    text = text.replace("Z", "+00:00")
-    return datetime.fromisoformat(text)
+def parse_moment(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def hours_since_launch(when):
-    return (when - LAUNCH).total_seconds() / 3600.0
+def hours_after_launch(moment):
+    return (moment - LAUNCH_UTC).total_seconds() / 3600.0
 
 
-def logit(p):
-    p = min(max(p, 1e-6), 1 - 1e-6)
-    return math.log(p / (1 - p))
+def to_logit(p):
+    p = min(max(p, 1e-6), 1.0 - 1e-6)
+    return math.log(p / (1.0 - p))
 
 
-def expit(x):
+def from_logit(x):
     if x >= 0:
         return 1.0 / (1.0 + math.exp(-x))
     e = math.exp(x)
     return e / (1.0 + e)
 
 
-def clamp_pct(x):
+def clamp_percent(x):
     return min(max(x, 0.0), 100.0)
 
 
-def collapse_events(history, n_trophies):
-    """One event per distinct page, in time order. Each event: (hours, players, [rate or None])."""
-    events = []
-    last_key = None
+def distinct_pages(history, n_trophies):
+    """Collapse reads to one entry per distinct page: (hours, players, rates)."""
+    pages = []
+    previous_key = None
     for read in history:
         rates = read.get("rates") or []
         players = read.get("players_tracked")
         if not players or len(rates) != n_trophies:
             continue
         key = (players, tuple(rates))
-        if key == last_key:
+        if key == previous_key:
             continue
-        last_key = key
-        events.append((hours_since_launch(parse_time(read["at"])), float(players), list(rates)))
-    return events
+        previous_key = key
+        pages.append((hours_after_launch(parse_moment(read["at"])),
+                      float(players), list(rates)))
+    return pages
 
 
-def wls(xs, ys, ws):
-    """Weighted least squares line. Returns (intercept at x_ref=last x, slope, residual var, slope var)."""
-    sw = sum(ws)
-    if sw <= 0 or len(xs) < 2:
+def weighted_line(xs, ys, ws):
+    """Weighted least squares. Returns (intercept, slope, resid var, slope var)."""
+    total_w = sum(ws)
+    if total_w <= 0 or len(xs) < 2:
         return None
-    mx = sum(w * x for w, x in zip(ws, xs)) / sw
-    my = sum(w * y for w, y in zip(ws, ys)) / sw
-    sxx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
+    mean_x = sum(w * x for w, x in zip(ws, xs)) / total_w
+    mean_y = sum(w * y for w, y in zip(ws, ys)) / total_w
+    sxx = sum(w * (x - mean_x) ** 2 for w, x in zip(ws, xs))
     if sxx <= 1e-12:
         return None
-    sxy = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys))
-    b = sxy / sxx
-    a = my - b * mx
-    resid = sum(w * (y - (a + b * x)) ** 2 for w, x, y in zip(ws, xs, ys)) / sw
-    n_eff = sw * sw / sum(w * w for w in ws)
+    sxy = sum(w * (x - mean_x) * (y - mean_y) for w, x, y in zip(ws, xs, ys))
+    slope = sxy / sxx
+    intercept = mean_y - slope * mean_x
+    resid = sum(w * (y - (intercept + slope * x)) ** 2
+                for w, x, y in zip(ws, xs, ys)) / total_w
+    n_eff = total_w * total_w / sum(w * w for w in ws)
     dof = max(n_eff - 2.0, 1.0)
-    var_res = resid * n_eff / dof
-    slope_var = var_res / (sxx / sw) / max(n_eff, 1.0)
-    return a, b, var_res, slope_var
+    resid_var = resid * n_eff / dof
+    slope_var = resid_var / (sxx / total_w) / max(n_eff, 1.0)
+    return intercept, slope, resid_var, slope_var
 
 
-def quantile(sorted_vals, tau):
-    n = len(sorted_vals)
-    pos = tau * (n - 1)
-    lo = int(math.floor(pos))
-    hi = min(lo + 1, n - 1)
-    frac = pos - lo
-    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+def empirical_quantile(sorted_values, tau):
+    n = len(sorted_values)
+    position = tau * (n - 1)
+    lower = int(math.floor(position))
+    upper = min(lower + 1, n - 1)
+    fraction = position - lower
+    return sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
 
 
-def is_chapter(trophy):
-    desc = (trophy.get("description") or "").lower()
-    return desc.startswith("complete chapter")
-
-
-def chapter_chain(trophies):
-    """Ids of the story chain in order: Chapter 1..n, then the final mission (rates can only fall along it)."""
-    chapters = []
-    final = None
-    for t in trophies:
-        desc = (t.get("description") or "").strip().lower()
-        if desc.startswith("complete chapter"):
-            digits = "".join(ch for ch in desc if ch.isdigit())
+def story_chain_ids(trophies):
+    """Chapter trophies in order, then the final mission: rates fall along it."""
+    numbered = []
+    finale = None
+    for trophy in trophies:
+        description = (trophy.get("description") or "").strip().lower()
+        if description.startswith("complete chapter"):
+            digits = "".join(ch for ch in description if ch.isdigit())
             if digits:
-                chapters.append((int(digits), t["id"]))
-        elif desc == "complete the final mission.":
-            final = t["id"]
-    chain = [tid for _, tid in sorted(chapters)]
-    if final is not None:
-        chain.append(final)
+                numbered.append((int(digits), trophy["id"]))
+        elif description == "complete the final mission.":
+            finale = trophy["id"]
+    chain = [tid for _, tid in sorted(numbered)]
+    if finale is not None:
+        chain.append(finale)
     return chain
 
 
-# The rules document Exophase's first refresh of the game: the launch-night page (638 players tracked) stayed
-# unchanged through the house's 04:00Z read and had refreshed by its 04:30:00Z read to 3,868 players tracked,
-# every rate but the 100% one lower. A launch-night-only history whose target falls after that read is
-# answered by that page, so it is forecast directly instead of drawn from the generic dilution prior.
-LAUNCH_PAGE_PLAYERS = 638
-FIRST_REFRESH_AT = datetime(2026, 11, 19, 4, 30, 0, tzinfo=timezone.utc)
-FIRST_REFRESH_PLAYERS = 3868.0
-REFRESH_GAIN = 1.10      # each trophy's launch-night earned count grows by about a tenth ...
-REFRESH_EXTRA = 0.35     # ... plus a fraction of a new earner, by the refreshed page
-REFRESH_SD = 0.20        # logit spread around that median
-Z_LEVELS = (-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722)
+# --- The documented first refresh -------------------------------------------------
+# The rules record that the 638-player launch-night page stood unchanged through
+# the 04:00Z read of 19 Nov and had refreshed by 04:30Z to 3,868 tracked players.
+# A case whose history is only that page and whose target sits just after the
+# refresh is answered by centring each trophy on its launch-night earned count,
+# grown slightly, spread over the refreshed player base.
+SEED_PAGE_PLAYERS = 638
+REFRESH_MOMENT = datetime(2026, 11, 19, 4, 30, 0, tzinfo=timezone.utc)
+REFRESH_PLAYERS = 3868.0
+REFRESH_COUNT_GROWTH = 1.10
+REFRESH_COUNT_EXTRA = 0.35
+REFRESH_LOGIT_SD = 0.20
 
 
-def known_first_refresh(events, target_text, horizon_h):
-    """Players tracked at the documented first refresh, when the case is the launch-night page before it."""
-    if not events or any(int(round(e[1])) != LAUNCH_PAGE_PLAYERS for e in events):
+def refresh_player_count(pages, target_text, horizon_hours):
+    if not pages or any(int(round(p[1])) != SEED_PAGE_PLAYERS for p in pages):
         return None
-    target = parse_time(target_text)
-    if target < FIRST_REFRESH_AT or horizon_h > 12.0:
+    if parse_moment(target_text) < REFRESH_MOMENT or horizon_hours > 12.0:
         return None
-    return FIRST_REFRESH_PLAYERS
+    return REFRESH_PLAYERS
 
 
-def first_refresh_rows(trophies, ids, seed_rates, seed_n, n_new):
-    n = len(trophies)
-    rows = []
-    for i in range(n):
-        r = seed_rates[i]
-        r = float(r) if isinstance(r, (int, float)) else 1.0
-        if r >= 99.5:
-            rows.append([99.95, 99.99, 100.0, 100.0, 100.0])
+def refresh_forecast_rows(trophies, ids, seed_rates, seed_players, refreshed_players):
+    count = len(trophies)
+    grid = []
+    for i in range(count):
+        rate = seed_rates[i]
+        rate = float(rate) if isinstance(rate, (int, float)) else 1.0
+        if rate >= 99.5:
+            grid.append([99.95, 99.99, 100.0, 100.0, 100.0])
             continue
-        e0 = round(r * seed_n / 100.0)
-        med = min(max((e0 * REFRESH_GAIN + REFRESH_EXTRA) / n_new, 1e-6), 1 - 1e-6)
-        rows.append([100.0 * expit(logit(med) + z * REFRESH_SD) for z in Z_LEVELS])
-    # Ordering rules level by level (a later chapter is no more common than an earlier one, the platinum no more
-    # common than any trophy): this only lowers a quantile to its neighbour's, so the band never widens.
-    index = {tid: i for i, tid in enumerate(ids)}
-    chain = [index[t] for t in chapter_chain(trophies) if t in index]
-    plat = [i for i, t in enumerate(trophies) if t.get("tier") == "platinum"]
-    for j in range(5):
-        for a_i, b_i in zip(chain, chain[1:]):
-            rows[b_i][j] = min(rows[b_i][j], rows[a_i][j])
-        for pi in plat:
-            rows[pi][j] = min(rows[pi][j], min(rows[k][j] for k in range(n) if k != pi))
-    out = []
-    for i in range(n):
-        qs = [round(clamp_pct(q), 4) for q in rows[i]]
+        seed_earned = round(rate * seed_players / 100.0)
+        median = (seed_earned * REFRESH_COUNT_GROWTH + REFRESH_COUNT_EXTRA) / refreshed_players
+        median = min(max(median, 1e-6), 1.0 - 1e-6)
+        grid.append([100.0 * from_logit(to_logit(median) + z * REFRESH_LOGIT_SD)
+                     for z in Z_OF_QUANTILE])
+    position = {tid: i for i, tid in enumerate(ids)}
+    chain = [position[t] for t in story_chain_ids(trophies) if t in position]
+    platinum = [i for i, t in enumerate(trophies) if t.get("tier") == "platinum"]
+    for level in range(5):
+        for earlier, later in zip(chain, chain[1:]):
+            grid[later][level] = min(grid[later][level], grid[earlier][level])
+        for pi in platinum:
+            grid[pi][level] = min(grid[pi][level],
+                                  min(grid[k][level] for k in range(count) if k != pi))
+    rows = []
+    for i in range(count):
+        qs = [round(clamp_percent(q), 4) for q in grid[i]]
         for j in range(1, 5):
             if qs[j] < qs[j - 1]:
                 qs[j] = qs[j - 1]
-        out.append({"id": ids[i], "q": qs})
-    return out
+        rows.append({"id": ids[i], "q": qs})
+    return rows
 
 
 def forecast(case, params=None):
-    p = dict(PARAMS)
+    cfg = dict(TUNING)
     if params:
-        p.update(params)
+        cfg.update(params)
     trophies = case["trophies"]
     n = len(trophies)
     ids = [t["id"] for t in trophies]
-    target_h = hours_since_launch(parse_time(case["target"]))
-    at_h = hours_since_launch(parse_time(case["at"]))
-    events = collapse_events(case.get("history") or [], n)
+    target_hours = hours_after_launch(parse_moment(case["target"]))
+    checkpoint_hours = hours_after_launch(parse_moment(case["at"]))
+    pages = distinct_pages(case.get("history") or [], n)
 
-    last_rates = [None] * n
+    latest_rates = [None] * n
     for read in reversed(case.get("history") or []):
         rates = read.get("rates") or []
         if len(rates) == n:
-            last_rates = list(rates)
+            latest_rates = list(rates)
             break
-    last_rates = [r if isinstance(r, (int, float)) else None for r in last_rates]
+    latest_rates = [r if isinstance(r, (int, float)) else None for r in latest_rates]
 
     rng = random.Random(20261126)
-    draws = int(p["draws"])
+    draws = int(cfg["draws"])
     samples = [[0.0] * draws for _ in range(n)]
-    # Draws share a common part across trophies (one week, one player base), so the ordering rules below rarely
-    # bind by chance; each trophy's marginal spread is unchanged by it.
     shared_z = [rng.gauss(0.0, 1.0) for _ in range(draws)]
     shared_g = [rng.gauss(0.0, 1.0) for _ in range(draws)]
-    rho = p["rho"]
+    common = cfg["common_share"]
 
-    def mix(k, sd):
-        return sd * (math.sqrt(rho) * shared_g[k] + math.sqrt(1.0 - rho) * rng.gauss(0.0, 1.0))
+    def mixed_noise(k, sd):
+        return sd * (math.sqrt(common) * shared_g[k]
+                     + math.sqrt(1.0 - common) * rng.gauss(0.0, 1.0))
 
-    c = p["c_hours"]
-    x_target = math.log(max(target_h, 0.5) + c)
+    offset = cfg["log_offset_h"]
+    x_target = math.log(max(target_hours, 0.5) + offset)
 
-    seed_t, seed_n, seed_rates = (events[0] if events else (at_h, 1.0, last_rates))
-    seed_counts = [((r or 0.0) / 100.0) * seed_n for r in seed_rates]
+    seed_hours, seed_players, seed_rates = (
+        pages[0] if pages else (checkpoint_hours, 1.0, latest_rates))
+    seed_earned = [((r or 0.0) / 100.0) * seed_players for r in seed_rates]
 
-    # Events usable for the cohort trend: enough players beyond the seed cohort.
-    usable = [e for e in events[1:] if e[1] - seed_n >= max(150.0, 0.25 * seed_n)]
+    # Pages with enough post-seed players to say something about the cohort.
+    usable = [p for p in pages[1:]
+              if p[1] - seed_players >= max(150.0, 0.25 * seed_players)]
 
-    if len(usable) >= 1:
-        last = usable[-1]
-        x_last = math.log(max(last[0], 0.5) + c)
-        dx = max(x_target - x_last, 0.0)
-        window = [e for e in usable if last[0] - e[0] <= p["window_h"]]
+    if usable:
+        last_page = usable[-1]
+        x_last = math.log(max(last_page[0], 0.5) + offset)
+        horizon_x = max(x_target - x_last, 0.0)
+        window = [p for p in usable if last_page[0] - p[0] <= cfg["fit_window_h"]]
 
-        # Players tracked: ln N against ln-time.
-        nx = [math.log(max(e[0], 0.5) + c) for e in window]
-        ny = [math.log(e[1]) for e in window]
-        nw = [math.exp(-(last[0] - e[0]) / p["decay_h"]) for e in window]
-        fitn = wls(nx, ny, nw) if len(window) >= 2 else None
-        n_slope = max(fitn[1], 0.0) if fitn else 1.0
-        n_slope_sd = math.sqrt(fitn[3]) + 0.3 * n_slope if fitn else 1.0
-        ln_n_last = math.log(last[1])
+        # Tracked players: log count against log time.
+        px = [math.log(max(p[0], 0.5) + offset) for p in window]
+        py = [math.log(p[1]) for p in window]
+        pw = [math.exp(-(last_page[0] - p[0]) / cfg["recency_halflife_h"]) for p in window]
+        players_fit = weighted_line(px, py, pw) if len(window) >= 2 else None
+        players_slope = max(players_fit[1], 0.0) if players_fit else 1.0
+        players_slope_sd = (math.sqrt(players_fit[3]) + 0.3 * players_slope
+                            if players_fit else 1.0)
+        log_players_last = math.log(last_page[1])
 
-        # Per-trophy cohort fits.
+        # One cohort-rate fit per trophy.
         fits = []
         for i in range(n):
-            xs, ys, ws, cvars = [], [], [], []
-            for e in window:
-                r = e[2][i]
-                if r is None:
+            xs, ys, ws, variances = [], [], [], []
+            for page in window:
+                rate = page[2][i]
+                if rate is None:
                     continue
-                cohort = e[1] - seed_n
-                earned = (r / 100.0) * e[1] - seed_counts[i]
+                cohort = page[1] - seed_players
+                earned = (rate / 100.0) * page[1] - seed_earned[i]
                 g = (max(earned, 0.0) + 0.5) / (cohort + 1.0)
-                g = min(max(g, 1e-5), 1 - 1e-5)
-                var_count = 1.0 / max(cohort * g * (1 - g), 0.25)
-                # Rounding the printed rate to 2 decimals: +-0.005 percentage points of the whole page.
-                var_round = (0.00005 * e[1] / max(cohort, 1.0)) ** 2 / max(g * (1 - g), 1e-6) ** 2 / 3.0
-                xs.append(math.log(max(e[0], 0.5) + c))
-                ys.append(logit(g))
-                cvars.append(var_count + var_round)
-                ws.append(math.exp(-(last[0] - e[0]) / p["decay_h"]) / (1.0 + var_count + var_round))
+                g = min(max(g, 1e-5), 1.0 - 1e-5)
+                var_count = 1.0 / max(cohort * g * (1.0 - g), 0.25)
+                var_round = ((0.00005 * page[1] / max(cohort, 1.0)) ** 2
+                             / max(g * (1.0 - g), 1e-6) ** 2 / 3.0)
+                xs.append(math.log(max(page[0], 0.5) + offset))
+                ys.append(to_logit(g))
+                variances.append(var_count + var_round)
+                ws.append(math.exp(-(last_page[0] - page[0]) / cfg["recency_halflife_h"])
+                          / (1.0 + var_count + var_round))
             if not ys:
                 fits.append(None)
                 continue
-            y_last = ys[-1]
-            v_last = cvars[-1]
-            fit = wls(xs, ys, ws) if len(xs) >= 3 else None
+            y_last, var_last = ys[-1], variances[-1]
+            fit = weighted_line(xs, ys, ws) if len(xs) >= 3 else None
             if fit:
-                a, b, var_res, slope_var = fit
-                level_fit = a + b * xs[-1]
-                # Blend the observed last level with the fitted line by their precisions.
-                prec_obs = 1.0 / max(v_last, 1e-6)
-                prec_fit = 1.0 / max(var_res, 1e-4)
-                level = (y_last * prec_obs + level_fit * prec_fit) / (prec_obs + prec_fit)
-                level_var = 1.0 / (prec_obs + prec_fit)
-                fits.append({"level": level, "level_var": level_var, "b": b, "b_var": slope_var,
-                             "res": var_res, "y": y_last})
+                intercept, slope, resid_var, slope_var = fit
+                fitted_level = intercept + slope * xs[-1]
+                precision_obs = 1.0 / max(var_last, 1e-6)
+                precision_fit = 1.0 / max(resid_var, 1e-4)
+                level = ((y_last * precision_obs + fitted_level * precision_fit)
+                         / (precision_obs + precision_fit))
+                level_var = 1.0 / (precision_obs + precision_fit)
+                fits.append({"level": level, "level_var": level_var, "slope": slope,
+                             "slope_var": slope_var, "resid": resid_var})
             else:
-                fits.append({"level": y_last, "level_var": v_last, "b": None, "b_var": None,
-                             "res": 0.04, "y": y_last})
+                fits.append({"level": y_last, "level_var": var_last, "slope": None,
+                             "slope_var": None, "resid": 0.04})
 
-        # Pooled slope as a function of level: weighted line of b on level across good fits.
-        px, py, pw = [], [], []
+        # Slopes pooled as a function of level across the trophies that have one.
+        pool_x, pool_y, pool_w = [], [], []
         for f in fits:
-            if f and f["b"] is not None and f["b_var"] is not None:
-                px.append(f["level"])
-                py.append(f["b"])
-                pw.append(1.0 / (f["b_var"] + 0.05))
-        pool = wls(px, py, pw) if len(px) >= 4 else None
-        if pool:
-            pa, pb = pool[0] - pool[1] * px[-1], pool[1]
+            if f and f["slope"] is not None and f["slope_var"] is not None:
+                pool_x.append(f["level"])
+                pool_y.append(f["slope"])
+                pool_w.append(1.0 / (f["slope_var"] + 0.05))
+        pooled = weighted_line(pool_x, pool_y, pool_w) if len(pool_x) >= 4 else None
+        if pooled:
+            pool_intercept = pooled[0] - pooled[1] * pool_x[-1]
+            pool_slope = pooled[1]
         else:
-            pa, pb = (sum(py) / len(py) if py else 0.3), 0.0
-        pool_var = pool[2] if pool else 0.25
+            pool_intercept = sum(pool_y) / len(pool_y) if pool_y else 0.3
+            pool_slope = 0.0
+        pool_var = pooled[2] if pooled else 0.25
 
         for i in range(n):
             f = fits[i]
-            lr = last_rates[i]
             if f is None:
-                base = logit((lr if lr is not None else 1.0) / 100.0)
+                fallback = latest_rates[i]
+                centre = to_logit((fallback if fallback is not None else 1.0) / 100.0)
                 for k in range(draws):
-                    samples[i][k] = 100.0 * expit(base + rng.gauss(0.0, 1.0))
+                    samples[i][k] = 100.0 * from_logit(centre + rng.gauss(0.0, 1.0))
                 continue
-            b_pool = pa + pb * f["level"]
-            if f["b"] is not None:
-                wi = 1.0 / (f["b_var"] + 1e-4)
-                wp = p["shrink_k"] / (pool_var + 0.02)
-                b = (f["b"] * wi + b_pool * wp) / (wi + wp)
-                b_sd = math.sqrt(1.0 / (wi + wp)) * p["slope_sd_mult"] + 0.15 * abs(b)
+            pooled_slope_i = pool_intercept + pool_slope * f["level"]
+            if f["slope"] is not None:
+                weight_own = 1.0 / (f["slope_var"] + 1e-4)
+                weight_pool = cfg["pool_weight"] / (pool_var + 0.02)
+                slope = ((f["slope"] * weight_own + pooled_slope_i * weight_pool)
+                         / (weight_own + weight_pool))
+                slope_sd = (math.sqrt(1.0 / (weight_own + weight_pool))
+                            * cfg["slope_sd_scale"] + 0.15 * abs(slope))
             else:
-                b = b_pool
-                b_sd = math.sqrt(pool_var) + 0.2 * abs(b)
-            b *= p["damp"]
-            sd_static = math.sqrt(f["level_var"] + p["base_sd"] ** 2)
-            sd_rw = p["rw"] * math.sqrt(dx) + 0.0
-            sd_total = math.sqrt((b_sd * dx) ** 2 + sd_static ** 2 + sd_rw ** 2)
+                slope = pooled_slope_i
+                slope_sd = math.sqrt(pool_var) + 0.2 * abs(slope)
+            slope *= cfg["slope_damp"]
+            static_sd = math.sqrt(f["level_var"] + cfg["level_sd_floor"] ** 2)
+            drift_sd = cfg["drift_sd"] * math.sqrt(horizon_x)
+            total_sd = math.sqrt((slope_sd * horizon_x) ** 2 + static_sd ** 2 + drift_sd ** 2)
             for k in range(draws):
-                yk = f["level"] + b * dx + mix(k, sd_total)
-                gk = expit(yk)
-                ln_nk = ln_n_last + max(n_slope * p["n_damp"] + shared_z[k] * n_slope_sd, 0.0) * dx
-                nk = math.exp(ln_nk)
-                cohort_k = max(nk - seed_n, 1.0)
-                # Count noise at the target for rare trophies.
-                earned = seed_counts[i] + gk * cohort_k
-                if earned < 50:
-                    earned = max(earned + rng.gauss(0.0, math.sqrt(max(earned, 0.5))), 0.0)
-                samples[i][k] = clamp_pct(100.0 * earned / nk)
+                y_draw = f["level"] + slope * horizon_x + mixed_noise(k, total_sd)
+                g_draw = from_logit(y_draw)
+                log_players = (log_players_last
+                               + max(players_slope * cfg["players_damp"]
+                                     + shared_z[k] * players_slope_sd, 0.0) * horizon_x)
+                players_draw = math.exp(log_players)
+                cohort_draw = max(players_draw - seed_players, 1.0)
+                earned_draw = seed_earned[i] + g_draw * cohort_draw
+                if earned_draw < 50:
+                    earned_draw = max(
+                        earned_draw + rng.gauss(0.0, math.sqrt(max(earned_draw, 0.5))), 0.0)
+                samples[i][k] = clamp_percent(100.0 * earned_draw / players_draw)
     else:
-        # Launch-night only: the page has not refreshed yet. Players arrive and dilute the early completers.
-        horizon_h = max(target_h - at_h, 0.0)
-        refresh = known_first_refresh(events, case["target"], horizon_h)
-        if refresh:
-            return {"trophies": first_refresh_rows(trophies, ids, seed_rates, seed_n, refresh)}
+        # Nothing but the launch-night page so far: expect dilution as players
+        # arrive, unless the documented first refresh answers the case.
+        horizon_hours = max(target_hours - checkpoint_hours, 0.0)
+        refreshed = refresh_player_count(pages, case["target"], horizon_hours)
+        if refreshed:
+            return {"trophies": refresh_forecast_rows(
+                trophies, ids, seed_rates, seed_players, refreshed)}
         for i in range(n):
-            lr = last_rates[i]
-            if lr is None:
-                lr = 1.0
-            e0 = seed_counts[i] if events else (lr / 100.0) * seed_n
-            # Launch night: Exophase's first refresh multiplies players tracked several times over.
-            # Its size is not in the history, so it is drawn wide around a fourfold rise.
-            grow_mu = math.log(4.0) + 0.1 * math.log1p(horizon_h / 24.0)
+            rate = latest_rates[i]
+            if rate is None:
+                rate = 1.0
+            start_earned = seed_earned[i] if pages else (rate / 100.0) * seed_players
+            growth_centre = math.log(4.0) + 0.1 * math.log1p(horizon_hours / 24.0)
             for k in range(draws):
-                growth = max(math.exp(grow_mu + 0.6 * shared_z[k]), 1.0)
-                nk = seed_n * growth
-                if lr >= 99.5:
-                    gk = 1.0 - abs(rng.gauss(0.0, 0.002))
+                growth = max(math.exp(growth_centre + 0.6 * shared_z[k]), 1.0)
+                players_draw = seed_players * growth
+                if rate >= 99.5:
+                    g_draw = 1.0 - abs(rng.gauss(0.0, 0.002))
                 else:
-                    # A new arrival rarely holds a trophy within hours of starting.
-                    gk = expit(logit(max(lr, 0.05) / 100.0) - 2.5 + mix(k, 1.0))
-                earned = e0 + gk * (nk - seed_n)
-                samples[i][k] = clamp_pct(100.0 * earned / nk)
+                    g_draw = from_logit(
+                        to_logit(max(rate, 0.05) / 100.0) - 2.5 + mixed_noise(k, 1.0))
+                earned_draw = start_earned + g_draw * (players_draw - seed_players)
+                samples[i][k] = clamp_percent(100.0 * earned_draw / players_draw)
 
-    # Ordering rules, applied draw by draw.
-    index = {tid: i for i, tid in enumerate(ids)}
-    chain = [index[t] for t in chapter_chain(trophies) if t in index]
-    plat = [i for i, t in enumerate(trophies) if t.get("tier") == "platinum"]
+    # Ordering rules, imposed on every draw.
+    position = {tid: i for i, tid in enumerate(ids)}
+    chain = [position[t] for t in story_chain_ids(trophies) if t in position]
+    platinum = [i for i, t in enumerate(trophies) if t.get("tier") == "platinum"]
     for k in range(draws):
-        for a_i, b_i in zip(chain, chain[1:]):
-            if samples[b_i][k] > samples[a_i][k]:
-                samples[b_i][k] = samples[a_i][k]
-        for pi in plat:
-            low = min(samples[j][k] for j in range(n) if j != pi)
-            if samples[pi][k] > low:
-                samples[pi][k] = low
+        for earlier, later in zip(chain, chain[1:]):
+            if samples[later][k] > samples[earlier][k]:
+                samples[later][k] = samples[earlier][k]
+        for pi in platinum:
+            lowest = min(samples[j][k] for j in range(n) if j != pi)
+            if samples[pi][k] > lowest:
+                samples[pi][k] = lowest
 
     rows = []
     for i in range(n):
-        vals = sorted(samples[i])
-        med_l = logit(min(max(quantile(vals, 0.5), LO), HI) / 100.0)
+        ordered = sorted(samples[i])
+        median_logit = to_logit(
+            min(max(empirical_quantile(ordered, 0.5), RATE_FLOOR), RATE_CEIL) / 100.0)
         qs = []
-        for tau in LEVELS:
-            q = quantile(vals, tau)
-            if tau in (0.05, 0.95) and p["tail"] != 1.0:
-                ql = logit(min(max(q, LO), HI) / 100.0)
-                q = 100.0 * expit(med_l + (ql - med_l) * p["tail"])
+        for tau in QUANTILES:
+            q = empirical_quantile(ordered, tau)
+            if tau in (0.05, 0.95) and cfg["tail_stretch"] != 1.0:
+                q_logit = to_logit(min(max(q, RATE_FLOOR), RATE_CEIL) / 100.0)
+                q = 100.0 * from_logit(
+                    median_logit + (q_logit - median_logit) * cfg["tail_stretch"])
             qs.append(q)
         for j in range(1, 5):
             if qs[j] < qs[j - 1]:
                 qs[j] = qs[j - 1]
-        qs = [round(clamp_pct(q), 4) for q in qs]
+        qs = [round(clamp_percent(q), 4) for q in qs]
         for j in range(1, 5):
             if qs[j] < qs[j - 1]:
                 qs[j] = qs[j - 1]
+        # Near-floor trophies: nudge up and widen the upper tail (wavefront timing).
+        if cfg["low_shift"] > 0 and median_logit < -3.0:
+            qs = [100.0 * from_logit(
+                to_logit(min(max(q, RATE_FLOOR), RATE_CEIL) / 100.0) + cfg["low_shift"])
+                for q in qs]
+            median_logit += cfg["low_shift"]
+        if cfg["low_uptail"] > 0 and median_logit < -3.0:
+            widened = []
+            for tau, q in zip(QUANTILES, qs):
+                if tau >= 0.75:
+                    q_logit = to_logit(min(max(q, RATE_FLOOR), RATE_CEIL) / 100.0)
+                    q = 100.0 * from_logit(
+                        median_logit + (q_logit - median_logit) * (1.0 + cfg["low_uptail"]))
+                widened.append(q)
+            qs = [round(clamp_percent(q), 4) for q in widened]
+            for j in range(1, 5):
+                if qs[j] < qs[j - 1]:
+                    qs[j] = qs[j - 1]
+        if cfg["pin_full"] and latest_rates[i] is not None and latest_rates[i] >= 99.5:
+            qs = [99.85, 99.95, 99.99, 100.0, 100.0]
         rows.append({"id": ids[i], "q": qs})
     return {"trophies": rows}
 
 
 def main():
-    in_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR") or "/input")
-    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for path in sorted(in_dir.glob("*.in")):
+    input_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR") or "/input")
+    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for path in sorted(input_dir.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
         result = forecast(case)
-        (out_dir / (path.stem + ".out")).write_text(json.dumps(result, separators=(",", ":")), encoding="utf-8")
+        (output_dir / (path.stem + ".out")).write_text(
+            json.dumps(result, separators=(",", ":")), encoding="utf-8")
     return 0
 
 

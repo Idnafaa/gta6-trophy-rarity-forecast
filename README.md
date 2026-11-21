@@ -21,12 +21,15 @@ How it works:
   quantiles, with ordering rules applied draw by draw (a later chapter is never more common than an earlier one, the
   platinum never more common than any trophy).
 
-Validation: no real week-one answer exists before the target, so the model was tuned and checked on 150 simulated
+Validation: no real week-one answer exists before the target, so the model was tuned and checked on simulated
 launch weeks (wide random ranges for player base, arrival curve, play hours, story length, side-content difficulty and
 Exophase refresh cadence), cut at the real deadline and scored at the real target with the contest's logit pinball
-loss: **0.250** for this model vs **0.737** for the house baseline and **0.454** for the house curve baseline; it beat
-the better of the two in 145 of 150 weeks, with 90% coverage of 0.93. Parameters were picked on 100 weeks and checked on
-the 50 held out.
+loss. A second tuning pass used 100 weeks conditioned to match the real Exophase page two days after launch (44,161
+players tracked; Chapter 1 at 11.98%, Chapter 2 at 1.71%, most side trophies still at the 0.01% floor): on the 30
+held-out conditioned weeks the previous tuning scored 0.451 and this one 0.414, and on the original 150 wide-range
+weeks this one scores 0.224 against the previous 0.250 and the house curve baseline's 0.454. The changes: gentler
+player-growth extrapolation, weaker slope pooling, a wider tail, and an upward nudge with a wider upper tail for
+trophies still near the floor, whose progressing-player wave is hardest to time.
 
 Practice refresh: the rules document Exophase's first refresh of the game (the 638-player launch-night page, unchanged
 through 04:00Z, had become 3,868 players tracked by the 04:30Z read). When a case holds only that launch-night page and
